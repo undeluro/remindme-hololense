@@ -1,0 +1,27 @@
+{
+	# Port 80 of the box is taken, so the certificate comes over TLS-ALPN-01: Let's Encrypt checks port 443, and
+	# Caddy opens it only for the seconds of obtaining or renewing the certificate. http_port only keeps Caddy off 80,
+	# admin moves the admin API off 2019 (taken on the box).
+	http_port 8823
+	admin localhost:8824
+	auto_https disable_redirects
+	storage file_system {
+		root C:/kinly/caddy/data
+	}
+}
+
+# Kinly backend for the page on Vercel: HTTPS for the REST API and WSS for /ws/stream (a page served over https://
+# may only open wss://, and browsers refuse a WebSocket to a self-signed certificate). There is no domain, so the
+# certificate is for the IP itself: Let's Encrypt short-lived profile (the only one for an IP), about 6 days, renewed
+# by Caddy. If another program holds 443 at renewal time, the renewal fails and is retried.
+95.217.106.60:8822 {
+	tls {
+		issuer acme {
+			profile shortlived
+			disable_http_challenge
+		}
+	}
+	header X-Robots-Tag "noindex, nofollow"
+	# The backend listens on 127.0.0.1:8821 only. WebSocket upgrades pass through reverse_proxy as they are.
+	reverse_proxy 127.0.0.1:8821
+}

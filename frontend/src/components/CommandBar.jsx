@@ -1,5 +1,5 @@
 import React from 'react';
-import { Mic, MicOff, StopCircle, PlayCircle, Settings, Database } from 'lucide-react';
+import { Mic, MicOff, StopCircle, PlayCircle, Settings, Database, Glasses } from 'lucide-react';
 
 export const CommandBar = ({
   isMuted,
@@ -48,9 +48,15 @@ export const CommandBar = ({
   );
 };
 
-export const TopBar = ({ onOpenSettings, onOpenDatabase }) => {
+export const TopBar = ({ onEnterAR, onOpenSettings, onOpenDatabase }) => {
   return (
     <div className="top-bar">
+      {onEnterAR && (
+        <button className="icon-text-btn" title="Show tags in the room (headset)" onClick={onEnterAR}>
+          <Glasses size={20} />
+          Enter AR
+        </button>
+      )}
       <button className="icon-btn" title="Memory/Logs" onClick={onOpenDatabase}>
         <Database size={20} />
       </button>

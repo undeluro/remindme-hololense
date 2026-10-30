@@ -3,6 +3,7 @@ import Webcam from 'react-webcam';
 import { CommandBar, TopBar } from './components/CommandBar';
 import DatabasePanel from './components/DatabasePanel';
 import KinlyLogo from './components/KinlyLogo';
+import { KinlyAR, arSupported } from './xr/KinlyAR';
 import './index.css';
 
 const CAMERA_CONSTRAINTS = {
@@ -43,6 +44,9 @@ function App() {
   const [commandMode, setCommandMode] = useState(false);
   const [trackedFaces, setTrackedFaces] = useState([]);
   const [chatLogs, setChatLogs] = useState([]);
+  // AR mode for the headset (src/xr/KinlyAR.js): the button shows only where the browser can start WebXR
+  const [arAvailable, setArAvailable] = useState(false);
+  const arRef = useRef(null);
   const [yoloDebug, setYoloDebug] = useState(false);
   // Automatic conversation topics (Settings) — remembered in this browser, on by default
   const [autoTopics, setAutoTopics] = useState(() => {
@@ -54,7 +58,7 @@ function App() {
   });
   const autoTopicsRef = useRef(autoTopics);  // read by the WebSocket handlers, which outlive renders
   // Some cameras/drivers deliver a mirrored picture. Flipping applies to the preview AND the frames sent
-  // to the backend (react-webcam's `mirrored`), so text stays readable for Gemini and tags stay on faces.
+  // to the backend (react-webcam's `mirrored`), so text stays readable for the LLM and tags stay on faces.
   const [flipCamera, setFlipCamera] = useState(() => {
     try {
       return localStorage.getItem('kinly.flipCamera') === 'on';
@@ -153,9 +157,12 @@ function App() {
       if (wsRef.current !== ws) return;
       try {
         const data = JSON.parse(event.data);
+        // The AR mode reacts to objects, chat answers and object confirmations too (it ignores the rest)
+        if (arRef.current && data.type !== 'FACES') arRef.current.onMessage(data);
         if (data.type === 'STATE_CHANGE') {
           setCommandMode(data.mode === 'COMMAND');
         } else if (data.type === 'FACES') {
+          if (arRef.current) arRef.current.onFaces(data);
           if (data.faces && data.faces.length > 0) {
             setTrackedFaces(data.faces.slice(0, 4));
           } else {
@@ -202,6 +209,8 @@ function App() {
   // Video Streaming Loop
   useEffect(() => {
     const frameInterval = setInterval(() => {
+      // In AR the XR loop sends the frames itself (with the head pose of each), so the 2D loop pauses
+      if (arRef.current && arRef.current.active) return;
       if (webcamRef.current && wsRef.current && wsRef.current.readyState === WebSocket.OPEN && isAssistingRef.current) {
         const imageSrc = webcamRef.current.getScreenshot(STREAM_FRAME_SIZE);
         if (imageSrc) {
@@ -215,6 +224,34 @@ function App() {
 
     return () => clearInterval(frameInterval);
   }, []);
+
+  useEffect(() => {
+    arSupported().then(setArAvailable);
+  }, []);
+
+  // AR: tags hang in the room next to people (HoloLens 2, Edge). Uses the camera stream this page already has.
+  const startAR = async () => {
+    const video = webcamRef.current && webcamRef.current.video;
+    if (!video || !video.videoWidth) {
+      addChatLog('system', 'The camera is not ready yet — try Enter AR again in a moment.');
+      return;
+    }
+    if (!arRef.current) {
+      arRef.current = new KinlyAR({
+        video,
+        apiBase: API_BASE,
+        send: (msg) => {
+          if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) wsRef.current.send(JSON.stringify(msg));
+        },
+      });
+    }
+    arRef.current.video = video;
+    try {
+      await arRef.current.start();
+    } catch (e) {
+      addChatLog('system', `AR did not start: ${e.name} ${e.message}`);
+    }
+  };
 
   const handleAddPerson = (face) => {
     if (!webcamRef.current) return;
@@ -235,7 +272,7 @@ function App() {
     captureRunningRef.current = true;
     captureAbortRef.current = false;
 
-    // Stop the command recording without sending it to Gemini
+    // Stop the command recording without sending it to the LLM
     cancelCommandRef.current = true;
     if (commandRecorderRef.current && commandRecorderRef.current.state !== 'inactive') {
       commandRecorderRef.current.stop();
@@ -451,6 +488,7 @@ function App() {
       {commandMode && <div className="glow-container"></div>}
       <KinlyLogo />
       <TopBar
+        onEnterAR={arAvailable ? startAR : null}
         onOpenSettings={() => { setIsSettingsOpen(true); setIsDatabaseOpen(false); setIsAddingPerson(false); }}
         onOpenDatabase={() => { setIsDatabaseOpen(true); setIsSettingsOpen(false); setIsAddingPerson(false); }}
       />
@@ -565,7 +603,7 @@ function App() {
                   checked={autoTopics}
                   onChange={(e) => setAutoTopics(e.target.checked)}
                 />
-                Save conversation topics automatically (audio of conversations with known people is summarized by Gemini)
+                Save conversation topics automatically (audio of conversations with known people is transcribed and summarized by OpenAI)
               </label>
               <label style={{ display: 'flex', alignItems: 'center', gap: '10px', cursor: 'pointer' }}>
                 <input

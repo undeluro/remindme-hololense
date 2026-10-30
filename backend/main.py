@@ -44,7 +44,7 @@ import db
 
 app = FastAPI()
 
-# Ambient context: skip the Gemini call when the camera image has barely changed
+# Ambient context: skip the LLM call when the camera image has barely changed
 SCENE_DIFF_MIN = 6.0  # mean absolute grayscale difference (0-255) on a small thumbnail
 
 
@@ -79,9 +79,9 @@ app.add_middleware(
 face_processor = FaceProcessor()
 audio_processor = AudioProcessor()
 object_processor = ObjectProcessor()
-label_reader = LLMOrchestrator(ws_send_callback=None)  # Gemini client for reading text on objects (HTTP endpoints)
+label_reader = LLMOrchestrator(ws_send_callback=None)  # LLM client for reading text on objects (HTTP endpoints)
 
-LABEL_READ_MAX_SHOTS = 3  # photos sent to Gemini when reading a label at save time
+LABEL_READ_MAX_SHOTS = 3  # photos sent to the LLM when reading a label at save time
 TOPIC_AFTER_SECONDS = 20.0  # a conversation ends when its person has been out of view this long
 TOPIC_CHECK_SECONDS = 5.0  # how often to check for finished conversations
 MIN_TOPIC_SPEECH_SECONDS = 15.0  # shorter (e.g. just "hi") gives no topic, so the last one isn't overwritten
@@ -103,6 +103,28 @@ async def add_new_face(req: AddFaceRequest):
     if "error" in result:
         return {"success": False, "error": result["error"]}
     return {"success": True, "message": result.get("message", "Success")}
+
+class IntroduceRequest(BaseModel):
+    audio_b64: str
+    mime: str = "audio/webm"
+
+@app.post("/api/faces/introduce")
+async def introduce_person(req: IntroduceRequest):
+    """Voice naming in the AR mode (no keyboard in a headset): "Niaz, developer" -> name and relation.
+    Saves nothing — the page shows the result for confirmation and then calls POST /api/faces."""
+    result = await label_reader.parse_introduction(req.audio_b64, req.mime)
+    if "error" in result:
+        return {"success": False, "error": result["error"]}
+    return {"success": True, **result}
+
+@app.post("/api/objects/introduce")
+async def describe_object(req: IntroduceRequest):
+    """Voice naming of an object in the AR mode: "Amoksiklav, three times a day" -> name, dosage, notes.
+    Saves nothing — the page shows the result for confirmation and then calls POST /api/objects."""
+    result = await label_reader.parse_object_description(req.audio_b64, req.mime)
+    if "error" in result:
+        return {"success": False, "error": result["error"]}
+    return {"success": True, **result}
 
 @app.get("/api/faces")
 async def get_all_faces():
@@ -198,7 +220,7 @@ class AddObjectRequest(BaseModel):
     # ... or one frame + box (older single-shot path)
     frame_b64: str | None = None
     object_box: dict | None = None  # {x, y, w, h} as percentages
-    # Text printed on the object (e.g. medicine name), read by Gemini — used to tell look-alikes apart
+    # Text printed on the object (e.g. medicine name), read by the LLM — used to tell look-alikes apart
     label_text: str = ""
     label_name: str = ""
     label_dosage: str = ""
@@ -216,7 +238,7 @@ async def prepare_object(req: PrepareObjectRequest):
 
     if req.hint_box:
         # Read the label from where the object was (evenly spread frames) while detection runs —
-        # Gemini (~2 s) and detecting the object in every frame (~1-3 s) overlap instead of adding up
+        # The LLM (~2 s) and detecting the object in every frame (~1-3 s) overlap instead of adding up
         step = max(1, len(req.frames) // LABEL_READ_MAX_SHOTS)
         label_idx = list(range(0, len(req.frames), step))[:LABEL_READ_MAX_SHOTS]
         hint_crops = await asyncio.to_thread(
@@ -358,6 +380,7 @@ async def websocket_endpoint(websocket: WebSocket):
     llm = LLMOrchestrator(ws_send_callback=_ws_send)
     
     latest_frame = None
+    latest_frame_seq = None  # optional client counter of the frame, echoed in FACES (the XR page places tags by it)
     session_log = []
     is_active = True  # Per-connection flag to control ambient loop
     current_faces = []  # Last known visible faces from the face loop
@@ -385,7 +408,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     print("Running 30-sec Ambient Context Gather...")
                     summary = await llm.generate_ambient_summary(frame, last_summary)
                     if not summary:
-                        print("Ambient: Gemini reports no meaningful change")
+                        print("Ambient: the LLM reports no meaningful change")
                         continue
                     print(f"Ambient context: {summary}")
                     last_summary = summary
@@ -403,7 +426,7 @@ async def websocket_endpoint(websocket: WebSocket):
             while True:
                 await frame_ready.wait()
                 frame_ready.clear()
-                frame = latest_frame
+                frame, seq = latest_frame, latest_frame_seq
                 faces = await asyncio.to_thread(face_processor.process_frame, frame)
                 faces = face_tracker.update(faces)
                 # Command mode: only the person in front of the user (middle of the frame)
@@ -416,7 +439,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 current_faces.extend(faces)
                 note_people_in_view(faces)
                 # Emit recognized faces back to the React UI
-                await manager.send_json({"type": "FACES", "faces": faces}, websocket)
+                await manager.send_json({"type": "FACES", "faces": faces, "seq": seq}, websocket)
         except asyncio.CancelledError:
             pass
         except Exception as e:
@@ -443,7 +466,7 @@ async def websocket_endpoint(websocket: WebSocket):
 
     # ---------- Conversation topics ----------
     # While a known person is in view, chunks with speech are collected per person. When they have been
-    # out of view for TOPIC_AFTER_SECONDS (or assisting stops / the app closes), Gemini turns the audio
+    # out of view for TOPIC_AFTER_SECONDS (or assisting stops / the app closes), the LLM turns the audio
     # into a short topic that is saved for that person and shown on their tag next time.
     conversations = {}  # name -> {"relation", "chunks": [webm bytes], "speech_seconds", "last_seen"}
     settings = {"auto_topics": True}  # toggled from the Settings panel
@@ -511,13 +534,13 @@ async def websocket_endpoint(websocket: WebSocket):
         in_view = [f["name"] for f in visible if f["name"] in known]
         return in_view[0] if in_view else None
 
-    # Recent label readings: [{"box", "reading" (None while Gemini is still reading), "time"}]
+    # Recent label readings: [{"box", "reading" (None while the LLM is still reading), "time"}]
     label_cache = []
 
     async def read_label_into(entry: dict, crop_jpeg: bytes):
-        """Background task: read a label with Gemini and store it in its cache entry.
+        """Background task: read a label with the LLM and store it in its cache entry.
 
-        A failed read (Gemini overloaded) is not stored as a reading — the entry stays pending
+        A failed read (the LLM call failed) is not stored as a reading — the entry stays pending
         ("checking label…") and is retried after LABEL_RETRY_SECONDS.
         """
         reading = await llm.read_label([crop_jpeg])
@@ -531,7 +554,7 @@ async def websocket_endpoint(websocket: WebSocket):
     async def resolve_labels(matched: list[dict]) -> list[dict]:
         """Use the printed text to pick between look-alike saved objects (e.g. two pill boxes of one brand).
 
-        Gemini reads the label in the background (~2-3 s), so the object loop never waits for it: until
+        The LLM reads the label in the background (~2-3 s), so the object loop never waits for it: until
         the reading arrives the tag says "checking label…", then it is reused while the object stays put.
         """
         now = asyncio.get_running_loop().time()
@@ -586,15 +609,17 @@ async def websocket_endpoint(websocket: WebSocket):
 
                 if manager.yolo_debug and latest_frame:
                     await asyncio.sleep(0.1) # Super fast refresh in debug mode
-                    matched = await asyncio.to_thread(object_processor.detect_all_yolo_debug, latest_frame)
-                    await _ws_send({"type": "OBJECTS", "objects": matched or []})
+                    frame, seq = latest_frame, latest_frame_seq
+                    matched = await asyncio.to_thread(object_processor.detect_all_yolo_debug, frame)
+                    await _ws_send({"type": "OBJECTS", "objects": matched or [], "seq": seq})
                     last_matched_names = set()
 
                 elif manager.mode == "COMMAND" and latest_frame:
                     await asyncio.sleep(0.5)  # Faster refresh in command mode
-                    matched = await asyncio.to_thread(object_processor.detect_central_yolo_object_preview, latest_frame)
+                    frame, seq = latest_frame, latest_frame_seq  # the XR page places the box by the frame's counter
+                    matched = await asyncio.to_thread(object_processor.detect_central_yolo_object_preview, frame)
                     print(f"[DEBUG] COMMAND mode YOLO detected {len(matched or [])} objects")
-                    await _ws_send({"type": "OBJECTS", "objects": matched or []})
+                    await _ws_send({"type": "OBJECTS", "objects": matched or [], "seq": seq})
                     last_matched_names = set()  # Force ambient to refresh when switching back
 
                 elif manager.mode == "AMBIENT" and latest_frame:
@@ -606,14 +631,15 @@ async def websocket_endpoint(websocket: WebSocket):
                             last_matched_names = "empty"
                         continue
                     
-                    matched = await asyncio.to_thread(object_processor.recognize_known_objects, latest_frame)
+                    frame, seq = latest_frame, latest_frame_seq
+                    matched = await asyncio.to_thread(object_processor.recognize_known_objects, frame)
                     matched = await resolve_labels(matched or [])
                     # Name + label, so "checking label…" -> real label text also reaches the UI
                     current_names = frozenset((m["name"], m.get("label", "")) for m in matched) if matched else frozenset()
                     
                     # Only send when the set of matched objects changes
                     if current_names != last_matched_names:
-                        await _ws_send({"type": "OBJECTS", "objects": matched or []})
+                        await _ws_send({"type": "OBJECTS", "objects": matched or [], "seq": seq})
                         last_matched_names = current_names
                 else:
                     await asyncio.sleep(0.5)
@@ -645,7 +671,12 @@ async def websocket_endpoint(websocket: WebSocket):
             if p_type == "FRAME":
                 # Just store it — face_loop picks up the newest frame when it's free
                 latest_frame = payload.get("data")
+                latest_frame_seq = payload.get("seq")
                 frame_ready.set()
+
+            elif p_type == "PROBE":
+                # Status from the WebXR probe page (/probe/): camera frames inside XR, input sources, errors
+                print(f"[Probe] {json.dumps(payload.get('data'))[:1500]}")
 
             elif p_type == "AUTO_TOPICS":
                 settings["auto_topics"] = bool(payload.get("enabled", True))
@@ -666,7 +697,7 @@ async def websocket_endpoint(websocket: WebSocket):
 
             elif p_type == "COMMAND_AUDIO_FULL":
                 audio_data = payload.get("data")
-                print("[Native Audio] Sending complete command chunk to Gemini...")
+                print("[Native Audio] Sending complete command chunk to the LLM...")
 
                 # Faces currently on screen (already recognized by face_loop)
                 face_context = list(current_faces)

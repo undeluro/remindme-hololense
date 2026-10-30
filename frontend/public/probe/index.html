@@ -1,0 +1,288 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>Kinly XR probe</title>
+<style>
+  :root { --bg: #f6f7f9; --card: #ffffff; --text: #1d2330; --muted: #5d6677; --line: #dfe3ea; --accent: #2f6fde; --bad: #c0392b; --good: #1e8e5a; }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 16px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  main { max-width: 760px; margin: 0 auto; padding: 20px 16px 40px; }
+  h1 { font-size: 22px; margin: 0 0 4px; }
+  p { margin: 6px 0; color: var(--muted); }
+  .row { display: flex; flex-wrap: wrap; gap: 10px; margin: 14px 0; }
+  button { font: inherit; font-weight: 600; padding: 14px 20px; border-radius: 10px; border: 1px solid var(--line); background: var(--card); color: var(--text); cursor: pointer; min-width: 180px; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button:disabled { opacity: .45; cursor: default; }
+  pre { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 12px; white-space: pre-wrap; font: 14px/1.5 ui-monospace, Menlo, Consolas, monospace; margin: 0; }
+  video { width: 240px; max-width: 100%; border-radius: 8px; border: 1px solid var(--line); background: var(--card); }
+  .err { color: var(--bad); }
+  canvas#gl { display: none; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Kinly XR probe</h1>
+  <p>Checks whether the headset camera keeps sending frames inside an immersive session and where name tags land next to faces.</p>
+  <div class="row">
+    <button id="cam" class="primary">1. Start camera</button>
+    <button id="vr" disabled>2. Enter VR</button>
+    <button id="ar" disabled>Enter AR</button>
+  </div>
+  <video id="video" playsinline muted></video>
+  <pre id="status">Waiting for the camera…</pre>
+  <p id="err" class="err"></p>
+</main>
+<canvas id="gl"></canvas>
+<script>
+'use strict';
+// ---------- settings (URL parameters override) ----------
+const Q = new URLSearchParams(location.search);
+const WS_URL = Q.get('ws') || 'wss://95.217.106.60:8822/ws/stream';
+const HFOV_DEG = parseFloat(Q.get('hfov') || '64.7');   // horizontal field of view of the headset photo camera
+const FACE_W = parseFloat(Q.get('facew') || '0.15');     // real face width, metres: distance comes from the box width
+const FRAME_MS = 300;                                    // same pace as the 2D app
+const LABEL_TTL_MS = 2500;
+
+const $ = (id) => document.getElementById(id);
+const video = $('video');
+const S = {                       // everything the status panel and the backend log show
+  phase: '2d', mode: '', space: '', error: '', ws: 'closed',
+  videoW: 0, videoH: 0, vfc: 0, vfcRate: 0, sent: 0, sentRate: 0, frozen: 0, captureMs: 0,
+  facesMsgs: 0, lastFacesAt: 0, faces: [], xrFrames: 0, xrRate: 0, selects: 0, inputs: '', hidden: false,
+};
+const logErr = (msg) => { S.error = String(msg).slice(0, 300); $('err').textContent = S.error; };
+
+// ---------- backend socket ----------
+let ws = null;
+function openSocket() {
+  ws = new WebSocket(WS_URL);
+  ws.onopen = () => { S.ws = 'open'; ws.send(JSON.stringify({ type: 'AUTO_TOPICS', enabled: false })); };
+  ws.onclose = () => { S.ws = 'closed'; setTimeout(openSocket, 2000); };
+  ws.onerror = () => { S.ws = 'error'; };
+  ws.onmessage = (e) => {
+    let m; try { m = JSON.parse(e.data); } catch { return; }
+    if (m.type === 'FACES') { S.facesMsgs++; S.lastFacesAt = performance.now(); S.faces = m.faces || []; placeFaces(m.faces || [], m.seq); }
+  };
+}
+function send(obj) { if (ws && ws.readyState === 1) ws.send(JSON.stringify(obj)); }
+
+// ---------- camera ----------
+const grab = document.createElement('canvas'); grab.width = 960; grab.height = 540;
+const grabCtx = grab.getContext('2d');
+const tiny = document.createElement('canvas'); tiny.width = 32; tiny.height = 18;
+const tinyCtx = tiny.getContext('2d', { willReadFrequently: true });
+let seq = 0, lastSum = -1, lastCapture = 0;
+const poses = new Map();          // seq -> head matrix at the moment that frame was taken
+
+function countVideoFrames() {
+  if (!video.requestVideoFrameCallback) return;
+  const tick = () => { S.vfc++; video.requestVideoFrameCallback(tick); };
+  video.requestVideoFrameCallback(tick);
+}
+
+function captureFrame(headMatrix) {
+  if (!video.videoWidth) return;
+  const t0 = performance.now();
+  grabCtx.drawImage(video, 0, 0, grab.width, grab.height);
+  tinyCtx.drawImage(video, 0, 0, tiny.width, tiny.height);
+  const px = tinyCtx.getImageData(0, 0, tiny.width, tiny.height).data;
+  let sum = 0; for (let i = 0; i < px.length; i += 7) sum = (sum + px[i] * (i + 1)) % 1000000007;
+  if (sum === lastSum) S.frozen++;
+  lastSum = sum;
+  const data = grab.toDataURL('image/jpeg', 0.8).split(',')[1];
+  S.captureMs = Math.round(performance.now() - t0);
+  seq++;
+  if (headMatrix) {
+    poses.set(seq, Float32Array.from(headMatrix));
+    if (poses.size > 60) poses.delete(poses.keys().next().value);
+  }
+  send({ type: 'FRAME', data, seq });
+  S.sent++;
+}
+
+let timer2d = null;
+$('cam').onclick = async () => {
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ video: { width: { ideal: 1280 }, height: { ideal: 720 } }, audio: false });
+    video.srcObject = stream; await video.play();
+    S.videoW = video.videoWidth; S.videoH = video.videoHeight;
+    countVideoFrames(); openSocket();
+    timer2d = setInterval(() => { if (S.phase === '2d') captureFrame(null); }, FRAME_MS);
+    $('cam').disabled = true;
+    if (navigator.xr) {
+      $('vr').disabled = !(await navigator.xr.isSessionSupported('immersive-vr').catch(() => false));
+      $('ar').disabled = !(await navigator.xr.isSessionSupported('immersive-ar').catch(() => false));
+    } else logErr('navigator.xr is missing: this browser has no WebXR');
+  } catch (e) { logErr('Camera: ' + e.name + ' ' + e.message); }
+};
+
+// ---------- math (column-major, as WebXR gives it) ----------
+function mul(a, b) {
+  const o = new Float32Array(16);
+  for (let c = 0; c < 4; c++) for (let r = 0; r < 4; r++) {
+    let s = 0; for (let k = 0; k < 4; k++) s += a[k * 4 + r] * b[c * 4 + k];
+    o[c * 4 + r] = s;
+  }
+  return o;
+}
+function apply(m, x, y, z) { return [m[0] * x + m[4] * y + m[8] * z + m[12], m[1] * x + m[5] * y + m[9] * z + m[13], m[2] * x + m[6] * y + m[10] * z + m[14]]; }
+function model(pos, yaw, w, h) {   // translate * rotateY(yaw) * scale(w, h)
+  const c = Math.cos(yaw), s = Math.sin(yaw);
+  return new Float32Array([c * w, 0, -s * w, 0, 0, h, 0, 0, s, 0, c, 0, pos[0], pos[1], pos[2], 1]);
+}
+
+// ---------- tags placed in the room ----------
+const tags = new Map();           // key -> {pos, text, sub, seen, tex}
+function placeFaces(faces, frameSeq) {
+  const head = poses.get(frameSeq);
+  if (!head) return;              // 2D phase, or a frame from before the session
+  const tanH = Math.tan(HFOV_DEG * Math.PI / 360), tanV = tanH * 9 / 16;
+  faces.forEach((f, i) => {
+    const cx = (f.x + f.w / 2) / 100, cy = (f.y + f.h / 2) / 100, wf = Math.max(f.w / 100, 0.01);
+    const dist = Math.min(6, Math.max(0.4, FACE_W / (wf * 2 * tanH)));
+    let dx = (cx * 2 - 1) * tanH, dy = -(cy * 2 - 1) * tanV, dz = -1;
+    const n = Math.hypot(dx, dy, dz); dx *= dist / n; dy *= dist / n; dz *= dist / n;
+    const p = apply(head, dx, dy, dz);
+    p[1] += 0.2;                  // the tag sits just above the head
+    const key = f.track_id != null ? 't' + f.track_id : f.name + i;
+    const old = tags.get(key);
+    const pos = old ? old.pos.map((v, k) => v + (p[k] - v) * 0.5) : p;
+    const text = f.name === 'Unknown Person' ? 'Unknown person' : f.name;
+    const sub = f.relation || (f.name === 'Unknown Person' ? '+ Add person (next step)' : '');
+    tags.set(key, { pos, text, sub, dist, seen: performance.now(), tex: old && old.text === text && old.sub === sub ? old.tex : null });
+  });
+}
+
+// ---------- WebGL1 renderer: textured quads only ----------
+const glCanvas = $('gl');
+const gl = glCanvas.getContext('webgl', { xrCompatible: true, alpha: true, antialias: false });
+let prog, buf, uMvp, uTex, aPos;
+function initGL() {
+  const vs = 'attribute vec2 p; uniform mat4 mvp; varying vec2 uv; void main(){ uv = vec2(p.x + 0.5, 0.5 - p.y); gl_Position = mvp * vec4(p, 0.0, 1.0); }';
+  const fs = 'precision mediump float; varying vec2 uv; uniform sampler2D tex; void main(){ gl_FragColor = texture2D(tex, uv); }';
+  const sh = (type, src) => { const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s); return s; };
+  prog = gl.createProgram(); gl.attachShader(prog, sh(gl.VERTEX_SHADER, vs)); gl.attachShader(prog, sh(gl.FRAGMENT_SHADER, fs)); gl.linkProgram(prog);
+  uMvp = gl.getUniformLocation(prog, 'mvp'); uTex = gl.getUniformLocation(prog, 'tex'); aPos = gl.getAttribLocation(prog, 'p');
+  buf = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-0.5, -0.5, 0.5, -0.5, -0.5, 0.5, 0.5, 0.5]), gl.STATIC_DRAW);
+}
+function textTexture(lines, w, h, big) {
+  const c = document.createElement('canvas'); c.width = w; c.height = h;
+  const x = c.getContext('2d');
+  x.fillStyle = 'rgba(250, 251, 253, 0.92)';           // light card; dark letters read as see-through on HoloLens
+  x.beginPath(); x.roundRect ? x.roundRect(4, 4, w - 8, h - 8, 24) : x.rect(4, 4, w - 8, h - 8); x.fill();
+  x.fillStyle = '#1d2330'; x.textBaseline = 'top';
+  let y = 22;
+  lines.forEach((line, i) => {
+    const size = i === 0 ? big : Math.round(big * 0.62);
+    x.font = (i === 0 ? '700 ' : '500 ') + size + 'px system-ui, Segoe UI, sans-serif';
+    x.fillText(line, 28, y, w - 56); y += size * 1.3;
+  });
+  const t = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, t);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, c);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  return t;
+}
+function drawQuad(viewProj, m, tex) {
+  gl.uniformMatrix4fv(uMvp, false, mul(viewProj, m));
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+}
+
+// ---------- immersive session ----------
+let session = null, space = null, panelPos = null, panelYaw = 0, panelTex = null, panelText = '', panelBuilt = 0;
+function statusLines() {
+  const ago = S.lastFacesAt ? ((performance.now() - S.lastFacesAt) / 1000).toFixed(1) + ' s ago' : 'never';
+  return [
+    'Kinly XR probe',
+    `${S.mode || '2D page'} · space ${S.space || '-'} · socket ${S.ws}`,
+    `camera ${S.videoW}x${S.videoH} · new video frames ${S.vfcRate}/s · frozen grabs ${S.frozen}`,
+    `frames sent ${S.sent} (${S.sentRate}/s, grab ${S.captureMs} ms) · XR frames ${S.xrRate}/s`,
+    `FACES ${S.facesMsgs}, last ${ago} · now: ${S.faces.map(f => f.name).join(', ') || 'none'}`,
+    `taps ${S.selects} · input: ${S.inputs || 'none'}`,
+  ];
+}
+
+async function enter(mode) {
+  try {
+    if (!prog) initGL();
+    session = await navigator.xr.requestSession(mode, { optionalFeatures: ['local'] });
+    S.mode = mode; S.phase = 'xr';
+    session.updateRenderState({ baseLayer: new XRWebGLLayer(session, gl) });
+    try { space = await session.requestReferenceSpace('local'); S.space = 'local'; }
+    catch { space = await session.requestReferenceSpace('viewer'); S.space = 'viewer'; }
+    session.addEventListener('select', () => { S.selects++; });
+    session.addEventListener('inputsourceschange', () => {
+      S.inputs = Array.from(session.inputSources).map(s => `${s.targetRayMode}${s.handedness !== 'none' ? '/' + s.handedness : ''}${s.hand ? '+hand' : ''}`).join(', ');
+    });
+    session.addEventListener('end', () => { session = null; S.phase = '2d'; S.mode = ''; panelPos = null; tags.clear(); });
+    session.requestAnimationFrame(onXRFrame);
+  } catch (e) { logErr(`${mode}: ${e.name} ${e.message}`); report(); }
+}
+$('vr').onclick = () => enter('immersive-vr');
+$('ar').onclick = () => enter('immersive-ar');
+
+function onXRFrame(t, frame) {
+  const s = frame.session; s.requestAnimationFrame(onXRFrame);
+  S.xrFrames++;
+  const pose = frame.getViewerPose(space);
+  if (!pose) return;
+  const head = pose.transform.matrix;
+  const now = performance.now();
+  if (now - lastCapture >= FRAME_MS) { lastCapture = now; captureFrame(head); }
+  if (!panelPos) {                // the status panel stays where it was put: 1.3 m ahead, a little below the eyes
+    const f = apply(head, 0, -0.25, -1.3); panelPos = f;
+    const o = pose.transform.position; panelYaw = Math.atan2(o.x - f[0], o.z - f[2]);
+  }
+  if (!panelTex || now - panelBuilt > 500) {   // redraw the panel twice a second, not every frame
+    const lines = statusLines(), joined = lines.join('|');
+    if (joined !== panelText) { if (panelTex) gl.deleteTexture(panelTex); panelTex = textTexture(lines, 1024, 320, 44); panelText = joined; }
+    panelBuilt = now;
+  }
+
+  const layer = s.renderState.baseLayer;
+  gl.bindFramebuffer(gl.FRAMEBUFFER, layer.framebuffer);
+  gl.clearColor(0, 0, 0, 0); gl.clear(gl.COLOR_BUFFER_BIT);   // transparent: the room shows through
+  gl.useProgram(prog); gl.enable(gl.BLEND); gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA); gl.disable(gl.DEPTH_TEST);
+  gl.bindBuffer(gl.ARRAY_BUFFER, buf); gl.enableVertexAttribArray(aPos); gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 0, 0);
+  gl.activeTexture(gl.TEXTURE0); gl.uniform1i(uTex, 0);
+  const eye = pose.transform.position;
+  for (const [k, tag] of tags) {
+    if (now - tag.seen > LABEL_TTL_MS) { if (tag.tex) gl.deleteTexture(tag.tex); tags.delete(k); continue; }
+    if (!tag.tex) tag.tex = textTexture([tag.text, tag.sub].filter(Boolean), 512, 160, 52);
+  }
+  for (const view of pose.views) {
+    const vp = layer.getViewport(view); gl.viewport(vp.x, vp.y, vp.width, vp.height);
+    const viewProj = mul(view.projectionMatrix, view.transform.inverse.matrix);
+    drawQuad(viewProj, model(panelPos, panelYaw, 0.64, 0.2), panelTex);
+    for (const tag of tags.values()) {
+      const yaw = Math.atan2(eye.x - tag.pos[0], eye.z - tag.pos[2]);
+      const scale = Math.max(1, tag.dist / 1.5);           // farther tags stay readable
+      drawQuad(viewProj, model(tag.pos, yaw, 0.32 * scale, 0.1 * scale), tag.tex);
+    }
+  }
+}
+
+// ---------- rates, page status and the report to the backend log ----------
+let prev = { vfc: 0, sent: 0, xr: 0, t: performance.now() };
+setInterval(() => {
+  const now = performance.now(), dt = (now - prev.t) / 1000;
+  S.vfcRate = ((S.vfc - prev.vfc) / dt).toFixed(1); S.sentRate = ((S.sent - prev.sent) / dt).toFixed(1); S.xrRate = ((S.xrFrames - prev.xr) / dt).toFixed(0);
+  prev = { vfc: S.vfc, sent: S.sent, xr: S.xrFrames, t: now };
+  S.hidden = document.hidden;
+  $('status').textContent = statusLines().slice(1).join('\n');
+}, 1000);
+function report() {
+  const { faces, ...rest } = S;
+  send({ type: 'PROBE', data: { ...rest, faces: faces.map(f => f.name), tags: tags.size, video: video.readyState, ua: navigator.userAgent.slice(0, 160) } });
+}
+setInterval(report, 3000);
+window.addEventListener('error', (e) => logErr(e.message));
+</script>
+</body>
+</html>

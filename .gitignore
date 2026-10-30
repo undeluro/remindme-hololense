@@ -1,2 +1,4 @@
 .DS_Store
 *.pt
+scratchpad/*
+!scratchpad/README.md

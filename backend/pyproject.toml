@@ -9,7 +9,8 @@ dependencies = [
     "deepface>=0.0.99",
     "edge-tts>=7.0.0",
     "fastapi[standard]",
-    "google-genai>=1.68.0",
+    "httpx>=0.28.0", # OpenAI calls through the metering gateway (llm_orchestrator.py)
+    "clip", # text encoder of YOLOE's open vocabulary; ultralytics imports it but does not depend on it
     "transformers>=4.50.0",
     "sentencepiece>=0.2.0",
     "faster-whisper>=1.1.0",
@@ -33,3 +34,5 @@ explicit = true
 
 [tool.uv.sources]
 torch = { index = "pytorch-cpu" }
+# An archive URL rather than git+https, so installing needs no git on the machine
+clip = { url = "https://github.com/ultralytics/CLIP/archive/7ffa84b3bfa40c42ecc1c77147a855e69cb2dd40.zip" }
