@@ -131,7 +131,7 @@ The probe sends a frame counter `seq` with every `FRAME`; the backend echoes the
 
 ### AR mode on HoloLens 2 (30.10.2026)
 
-**Enter AR** (top bar; shown only where the browser can start WebXR) takes the page into an immersive session
+**Enter AR** (top bar; shown wherever the browser has WebXR) takes the page into an immersive session
 (`src/xr/KinlyAR.js`): there is no browser window, everything hangs in the room. Screens follow the owner's design v4
 "Care AR" (RemindMe — glasses interface, https://claude.ai/artifact/7RYr9rYnxNXFEN3hqP1V2d): dark-green glass, solid
 white text, mint accents, Atkinson Hyperlegible. Point with the hand ray (a light beam with a white ring at the end; the
@@ -139,27 +139,29 @@ button under it lights up) and pinch (air tap) to press.
 
 | Screen (design v4) | What it does here |
 |---|---|
-| HUD | Date and time high in the view; stays put and moves in front again after you look away for a second. Chips: walking, paused help, updates waiting for a pause in talk |
-| Idle | Only the HUD and "Pinch for the menu" |
-| Face tag | Known people at once: initial, name, relation, a white line with a mint dot to the face, the last topic as a chip. Next to the face at face height, to its right (owner: above the head was too high) |
+| HUD | Date and time at the top edge of the view, follows the head (owner, 31.10.2026). Chips: walking, paused help, updates waiting for a pause in talk |
+| Menu | Always on at the bottom edge of the view, follows the head (owner, 31.10.2026; the design summons it with a pinch): **What's here?**, **My memory**, **Speak**, **Pause help**, **Exit AR** (the last is not in the design) |
+| Face tag | Known people up to 2 m away: initial and name only, a white line with a mint dot to the face. A pinch on the tag adds the relation, the last topic and **Forget** (asks first, then `DELETE /api/faces/{name}`); a pinch at nothing closes it (owner, 31.10.2026). Next to the face at face height, to its right (owner: above the head was too high) |
 | Unknown person | A tag with **Add person** only after the camera has held that one face near the middle for 3 s (owner's choice; the design says "no dwell"). Add → say "Niaz, developer" (`POST /api/faces/introduce`) → **Yes, save** (`POST /api/faces`) |
-| Edge arrow | A known person seen in the last minute who is now out of view: name, relation and "on your right / left / behind you" at the edge of the view |
-| Walking | Head moving faster than 0.5 m/s for 1.5 s: everything hides except the HUD ("Walking — screen kept clear") |
-| Menu | A pinch at nothing opens it where you look: **What's here?**, **My memory**, **Speak**, **Pause help**, **Exit AR** (the last is not in the design). A pinch at nothing closes it |
+| Walking | Head moving faster than 0.5 m/s for 1.5 s: everything hides except the HUD and the menu ("Walking — screen kept clear") |
 | What's here? | The backend's command mode finds the object in the middle; mint frame on it and a card "This looks like a …" with **Save** / **Not now**. Save takes three photos while you turn it, reads the label (`/api/objects/prepare`), then Step 1 "Is this your medicine?" and Step 2 name, dosage, note with **Yes, save** / **Change it** (say "Amoxiclav, 3 times a day", `POST /api/objects/introduce`) |
 | Saved objects | Recognised saved objects get the frame and a card at the object (name, dosage or note) |
 | Speak | Say a request as with "Hey Kinly" (note, reminder, question, topic); the answer is shown and said aloud |
-| My memory | A board where you looked: people and objects from the database (first four, "+ N more") and **Close** |
+| My memory | A board where you looked, between the HUD and the menu: people and objects from the database (first four, "+ N more") and **Close** |
 | Saved | "Saved …" and "Topic saved …" wait until you have been quiet for 1.5 s (microphone level), then show under the HUD with a soft chime |
 
 - Every 3 s the AR mode writes its state to `C:\kinly\logs\backend.log` as a `[Probe]` line with `"app": "kinly-ar"`:
-  microphone, hands, taps and hits, the open card and its text, menu, board, walking, paused, waiting updates, tags,
+  microphone, hands, taps and hits, the open card and its text, the opened tag, board, walking, paused, waiting updates, tags,
   objects, errors.
 - How it works: WebXR gives the headset browser no camera image, so the page keeps its ordinary camera stream, sends
   frames with `seq` from the XR loop (the 2D loop pauses), keeps the head pose of each, and puts a tag on the ray through
   the face or object — direction from its place in the frame, distance from its width (a face ~15 cm, a held object
   ~12 cm). The backend echoes `seq` in FACES and OBJECTS. Tune from the link without a new build: `?hfov=` (camera field
-  of view, default 64.7°), `?facew=` (0.15 m), `?objw=` (0.12 m).
+  of view, default 64.7°), `?facew=` (0.15 m), `?objw=` (0.12 m), `?maxdist=` (people farther get no tag, 2 m),
+  `?hudup=` / `?menudown=` (HUD and menu, degrees above / below the middle of the view, 10 each).
+- The person-out-of-view arrow of the design was removed (owner, 31.10.2026: it overloaded the view).
+- A red panel of frame timings in the headset is the OpenXR frame timing overlay, not the page: it is switched off in
+  the OpenXR Tools for Windows Mixed Reality app (Settings → Display frame timing overlay) or in Device Portal → OpenXR.
 - Session settings are the ones that start on this headset: WebGL 1, `immersive-vr` (the display is additive, so it is
   AR), `local` space, no hand tracking; hands arrive as `tracked-pointer` rays.
 - Not in this version: the design's "say a button's name" (buttons are pressed with a pinch only) and a memory board that

@@ -44,9 +44,10 @@ function App() {
   const [commandMode, setCommandMode] = useState(false);
   const [trackedFaces, setTrackedFaces] = useState([]);
   const [chatLogs, setChatLogs] = useState([]);
-  // AR mode for the headset (src/xr/KinlyAR.js): the button shows only where the browser can start WebXR
+  // AR mode for the headset (src/xr/KinlyAR.js): the button shows wherever the browser has WebXR
   const [arAvailable, setArAvailable] = useState(false);
   const arRef = useRef(null);
+  const xrStatusRef = useRef({ xr: !!navigator.xr, immersiveVr: null });
   const [yoloDebug, setYoloDebug] = useState(false);
   // Automatic conversation topics (Settings) — remembered in this browser, on by default
   const [autoTopics, setAutoTopics] = useState(() => {
@@ -146,6 +147,7 @@ function App() {
       console.log('Connected to companion backend');
       // The backend keeps settings per connection — send the saved choice on every (re)connect
       ws.send(JSON.stringify({ type: 'AUTO_TOPICS', enabled: autoTopicsRef.current }));
+      reportXr('connected');
     };
 
     ws.onerror = (e) => {
@@ -225,8 +227,27 @@ function App() {
     return () => clearInterval(frameInterval);
   }, []);
 
+  // What the browser says about WebXR goes to the backend log ([Probe] "kinly-2d"), so a missing button is explained.
+  // The button shows whenever WebXR exists: on 30.10.2026 the headset once answered "not supported" at page load
+  // (its mixed reality runtime was not ready yet) and the button never came back. The answer is checked again when
+  // the XR device changes, and a failed start says why.
+  const reportXr = (event, extra = {}) => {
+    const ws = wsRef.current;
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: 'PROBE', data: { app: 'kinly-2d', event, ...xrStatusRef.current, ...extra, ua: navigator.userAgent.slice(0, 160) } }));
+    }
+  };
+
   useEffect(() => {
-    arSupported().then(setArAvailable);
+    const xr = navigator.xr;
+    setArAvailable(!!xr);
+    const check = () => arSupported().then((ok) => {
+      xrStatusRef.current = { xr: !!xr, immersiveVr: ok };
+      reportXr('xr-check');
+    });
+    check();
+    if (xr && xr.addEventListener) xr.addEventListener('devicechange', check);
+    return () => { if (xr && xr.removeEventListener) xr.removeEventListener('devicechange', check); };
   }, []);
 
   // AR: tags hang in the room next to people (HoloLens 2, Edge). Uses the camera stream this page already has.
@@ -234,6 +255,7 @@ function App() {
     const video = webcamRef.current && webcamRef.current.video;
     if (!video || !video.videoWidth) {
       addChatLog('system', 'The camera is not ready yet — try Enter AR again in a moment.');
+      reportXr('enter-ar-failed', { error: 'camera not ready' });
       return;
     }
     if (!arRef.current) {
@@ -250,6 +272,7 @@ function App() {
       await arRef.current.start();
     } catch (e) {
       addChatLog('system', `AR did not start: ${e.name} ${e.message}`);
+      reportXr('enter-ar-failed', { error: `${e.name} ${e.message}`.slice(0, 200) });
     }
   };
 

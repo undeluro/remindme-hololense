@@ -31,12 +31,17 @@ const UNKNOWN = 'Unknown Person';
 // right of the face as the wearer sees it. A white line with a mint dot joins the tag to the face (design v4).
 const FACE_EDGE = 0.075; // half a face: where the dot sits, metres right of the face centre
 const CONNECT = 0.04; // length of the line from the dot to the tag
+// Owner, 31.10.2026: the date and time stick to the top edge of the view and the menu, always on, to the bottom edge;
+// both follow the head. HoloLens 2 shows about 29° vertically: tune with ?hudup=…&menudown=… (degrees from the middle).
+const HUD_DIST = 1.8, HUD_UP_DEG = parseFloat(Q.get('hudup') || '10'), HUD_SCALE = 1.3;
+const MENU_DIST = 1.5, MENU_DOWN_DEG = parseFloat(Q.get('menudown') || '10'), MENU_SCALE = 0.75;
+const FOLLOW_S = 0.12; // smoothing of the follow: takes out head tremor, still feels attached
 // Places in front of the wearer, metres
-const HUD_DIST = 1.8, HUD_UP = 0.27, HUD_SCALE = 1.3; // the HUD sits high in the view, a little larger at 1.8 m
-const HUD_AWAY_DEG = 30, HUD_AWAY_MS = 1000; // turned away this far for this long: the HUD moves in front again
-const MENU_DIST = 1.4, BOARD_DIST = 1.9, FRONT_DIST = 1.3;
-// Person out of view (design: edge arrow): seen within this time, now outside the view by this angle
-const PERSON_MEMORY_MS = 60000, OUT_OF_VIEW_DEG = 25, EDGE_X = 0.34, EDGE_DIST = 1.4;
+const BOARD_DIST = 1.9, FRONT_DIST = 1.3;
+// Owner, 31.10.2026: people are recognised up to 2 m (the distance comes from the face width); the tag shows the name
+// only, a pinch on it adds the relation, the last topic and Forget
+const PERSON_MAX_M = parseFloat(Q.get('maxdist') || '2');
+const FORGET_MUTE_MS = 5000; // after Forget, the backend's vote still names the person for a few frames
 // Walking (design: everything hides except the time): head speed over the floor
 const WALK_START_MS = 1500, WALK_START_SPEED = 0.5, WALK_STOP_MS = 2000, WALK_STOP_SPEED = 0.25;
 // "What's here?": wait for an object in the middle, then take three photos while it is turned
@@ -65,8 +70,7 @@ const ICON = { // 24-unit paths, drawn as strokes
   play: 'M7 4l13 8-13 8z',
   sun: 'M12 8a4 4 0 1 0 0 8a4 4 0 1 0 0-8 M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4',
   walk: 'M13 2a2 2 0 1 0 0 4a2 2 0 1 0 0-4 M7 21l3-6 3 2v4 M10 15l1-6 4 3 3 1 M11 9l-3 2-1 3',
-  chevronR: 'm9 18 6-6-6-6',
-  chevronL: 'm15 18-6-6 6-6',
+  trash: 'M3 6h18 M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2 M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6 M10 11v6 M14 11v6',
   camera: 'M14.5 4h-5L7 7H4a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2h-3z M12 10a3 3 0 1 0 0 6a3 3 0 1 0 0-6',
   person: 'M19 21v-2a4 4 0 0 0-4-4H9a4 4 0 0 0-4 4v2 M12 3a4 4 0 1 0 0 8a4 4 0 1 0 0-8',
   pill: 'M10.5 20.5 3.5 13.5a4.95 4.95 0 1 1 7-7l7 7a4.95 4.95 0 1 1-7 7z M8.5 8.5l7 7',
@@ -158,11 +162,6 @@ function beam(a, b, eye, width) { // a thin quad from a to b, turned around its 
     n[0], n[1], n[2], 0, c[0], c[1], c[2], 1]);
 }
 const rayOf = (m) => ({ o: [m[12], m[13], m[14]], d: [-m[8], -m[9], -m[10]] });
-// Signed horizontal angle from the gaze to a point, degrees: positive = to the wearer's right
-function sideAngle(head, eye, p) {
-  const g = unit([-head[8], 0, -head[10]]), t = unit([p[0] - eye[0], 0, p[2] - eye[2]]);
-  return (Math.atan2(g[0] * t[2] - g[2] * t[0], g[0] * t[0] + g[2] * t[2]) * 180) / Math.PI;
-}
 // A point straight ahead of the gaze (level), `d` metres away and `up` metres above the eye
 function ahead(head, eye, d, up) {
   const g = unit([-head[8], 0, -head[10]]);
@@ -239,15 +238,17 @@ export class KinlyAR {
     this.poses = new Map(); // seq -> head matrix when that frame was taken
     this.frames = new Map(); // seq -> JPEG (base64) of that frame, for saving a face or an object
     this.known = new Map(); // name -> tag of a known person in view
-    this.lastSeen = new Map(); // name -> where and when a known person was last seen (edge arrow)
+    this.expanded = null; // name of the person whose tag was pinched open
+    this.forgotten = new Map(); // name -> until when to ignore them after Forget
     this.unknown = null; // the one unknown person shown after a dwell
     this.dwell = null;
     this.objects = []; // saved objects recognised in view: [{pos, size, ...}]
     this.target = null; // the object in the middle during "What's here?"
     this.flow = null; // the open card: adding a person, an object, Speak, a notice
-    this.menu = null;
     this.board = null;
-    this.hud = null;
+    this.hud = null; // {pos, yaw} at the top edge of the view
+    this.menuAt = null; // {pos, yaw} at the bottom edge
+    this.lastFollow = 0;
     this.toast = null;
     this.toasts = []; // updates waiting for a pause in talk
     this.walking = false;
@@ -273,7 +274,7 @@ export class KinlyAR {
         hits: s.hits, lastAction: s.lastAction,
         flow: f ? `${f.kind}:${f.state}` : '',
         card: f && f.view ? [f.view.kicker, f.view.big, f.view.name, f.view.title, f.view.status, f.view.body, f.view.hint].filter(Boolean).join(' / ').slice(0, 160) : '',
-        menu: !!this.menu, board: !!this.board, walking: this.walking, paused: this.paused,
+        expanded: this.expanded || '', board: !!this.board, walking: this.walking, paused: this.paused,
         toastsWaiting: this.toasts.length, talking: this._talking(),
         known: [...this.known.keys()], objects: this.objects.map((o) => o.name), target: this.target ? this.target.name : '',
         unknownTag: !!this.unknown, dwellMs: this.dwell ? Math.round(this.dwell.lastSeen - this.dwell.since) : 0,
@@ -292,8 +293,10 @@ export class KinlyAR {
     let best = Infinity;
     for (const f of msg.faces || []) {
       const p = this._project(f, head, FACE_W);
+      if (p.dist > PERSON_MAX_M) continue; // someone far off, caught by chance: no tag
       const box = { x: f.x, y: f.y, w: f.w, h: f.h };
       if (f.name !== UNKNOWN) {
+        if (now < (this.forgotten.get(f.name) || 0)) continue;
         const old = this.known.get(f.name);
         const topic = (f.topics && f.topics.length ? f.topics[f.topics.length - 1] : '') || '';
         const tag = {
@@ -301,7 +304,6 @@ export class KinlyAR {
           name: f.name, relation: f.relation || '', topic,
         };
         this.known.set(f.name, tag);
-        this.lastSeen.set(f.name, { pos: tag.pos, relation: tag.relation, seen: now });
         continue;
       }
       // The unknown person already shown: follow them and keep the newest frame of them for saving
@@ -478,7 +480,7 @@ export class KinlyAR {
   }
 
   // ---------- flows: each opens one card ----------
-  _frontAnchor(d = FRONT_DIST, up = -0.05) {
+  _frontAnchor(d = FRONT_DIST, up = 0.02) { // a little high: the menu holds the bottom of the view
     const head = this.head, eye = this.eye || [0, 1.6, 0];
     const pos = head ? ahead(head, eye, d, up) : [eye[0], eye[1] + up, eye[2] - d];
     return { kind: 'front', pos, yaw: yawTo(pos, eye), scale: 1 };
@@ -649,7 +651,7 @@ export class KinlyAR {
   }
 
   async _openBoard() {
-    const anchor = this._frontAnchor(BOARD_DIST, -0.1); // below the HUD, inside the headset's narrow view
+    const anchor = this._frontAnchor(BOARD_DIST, 0.03); // between the HUD and the menu, inside the narrow view
     this.board = { anchor, rows: [{ title: 'Loading…', sub: '', icon: 'memory' }] };
     const [faces, objects] = await Promise.all([this._get('/api/faces'), this._get('/api/objects')]);
     if (!this.board || this.board.anchor !== anchor) return;
@@ -667,9 +669,34 @@ export class KinlyAR {
     if (state) this.flow.state = state;
   }
 
-  async _post(path, body) {
+  // Forgetting a person (owner, 31.10.2026: from the HUD, not only from the database panel)
+  _forgetAsk(name) {
+    const tag = this.known.get(name);
+    if (!tag) return;
+    this._close();
+    this.expanded = null;
+    this.flow = { kind: 'forget', state: 'confirm', token: 0, name, anchor: this._faceAnchor(tag) };
+    this._view({ title: `Forget ${name}?`, hint: 'Their face is deleted from memory', actions: ['forget-yes', 'cancel'] }, 'confirm');
+  }
+
+  async _forget() {
+    const f = this.flow;
+    if (!f || f.kind !== 'forget') return;
+    const token = ++f.token;
+    this._view({ title: `Forgetting ${f.name}…`, actions: [] }, 'saving');
+    const data = await this._post(`/api/faces/${encodeURIComponent(f.name)}`, undefined, 'DELETE');
+    if (this.flow !== f || f.token !== token) return;
+    if (!data.success) return this._view({ title: 'Could not forget', hint: String(data.error || '').slice(0, 80), actions: ['forget-yes', 'cancel'] }, 'error');
+    this.forgotten.set(f.name, performance.now() + FORGET_MUTE_MS);
+    this.known.delete(f.name);
+    this._close();
+    this._queueToast('Forgotten', `${f.name} is no longer recognised`);
+  }
+
+  async _post(path, body, method = 'POST') {
     try {
-      const r = await fetch(`${this.apiBase}${path}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+      const init = body === undefined ? { method } : { method, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) };
+      const r = await fetch(`${this.apiBase}${path}`, init);
       return await r.json();
     } catch (e) {
       this.stats.error = `${path}: ${e}`.slice(0, 200);
@@ -688,8 +715,10 @@ export class KinlyAR {
   _action(id) {
     this.stats.lastAction = id;
     const f = this.flow;
-    if (id.startsWith('m-')) this.menu = null; // a menu choice closes the menu
-    if (id === 'add') this._addPerson();
+    if (id.startsWith('p:')) { const name = id.slice(2); this.expanded = this.expanded === name ? null : name; }
+    else if (id === 'forget') this._forgetAsk(this.expanded);
+    else if (id === 'forget-yes') this._forget();
+    else if (id === 'add') this._addPerson();
     else if (id === 'm-here') this._whatsHere();
     else if (id === 'm-memory') this._openBoard();
     else if (id === 'm-speak') this._speak();
@@ -709,7 +738,7 @@ export class KinlyAR {
     this.paused = on;
     if (on) {
       this._close();
-      this.known.clear(); this.objects = []; this.unknown = null; this.dwell = null;
+      this.known.clear(); this.objects = []; this.unknown = null; this.dwell = null; this.expanded = null;
     }
   }
 
@@ -730,7 +759,7 @@ export class KinlyAR {
     return best ? { b: best, t: bt } : null;
   }
 
-  // A pinch on a button presses it; a pinch at nothing opens or closes the menu (design v4)
+  // A pinch on a button (or a person's tag) presses it; a pinch at nothing closes an open tag
   _onSelect(e) {
     if (this.audioCtx && this.audioCtx.state === 'suspended') this.audioCtx.resume().catch(() => {});
     const pose = e.frame.getPose(e.inputSource.targetRaySpace, this.space);
@@ -741,16 +770,9 @@ export class KinlyAR {
     if (h) {
       this.stats.hits += 1;
       this._action(h.b.id);
-    } else if (!this.walking) {
-      if (this.menu) this.menu = null;
-      else if (!this.flow) this._openMenu();
+    } else {
+      this.expanded = null;
     }
-  }
-
-  _openMenu() {
-    const a = this._frontAnchor(MENU_DIST, -0.12);
-    this.menu = { pos: a.pos, yaw: a.yaw };
-    this.stats.lastAction = 'menu';
   }
 
   _onEnded() {
@@ -812,11 +834,12 @@ export class KinlyAR {
   }
 
   // FaceTag (design: 130 px pill): avatar circle, name in white, a second line in mint. Also used for saved
-  // objects (an icon in the circle instead of the initial).
-  _tagTex(name, second, initial, iconName) {
+  // objects (an icon in the circle instead of the initial). A person's tag is pressable: under a hand ray it gets a
+  // thick white border like a button.
+  _tagTex(name, second, initial, iconName, focus = false) {
     const W = 22 + 84 + 18 + Math.max(textWidth(name, 700, 40), second ? textWidth(second, 700, 28) : 0) + 34;
-    return this._paint(`tag|${name}|${second}|${initial}|${iconName}`, W + 4, 134, (x) => {
-      glass(x, 2, 2, W, 130, 30, V4.glass, V4.edge);
+    return this._paint(`tag|${name}|${second}|${initial}|${iconName}|${focus}`, W + 4, 134, (x) => {
+      glass(x, 2, 2, W, 130, 30, V4.glass, focus ? '#FFFFFF' : V4.edge, focus ? 4 : 1.5);
       x.fillStyle = V4.mint; x.beginPath(); x.arc(2 + 22 + 42, 67, 42, 0, Math.PI * 2); x.fill();
       if (iconName) icon(x, ICON[iconName], 2 + 22 + 42 - 21, 67 - 21, 42, V4.ink, 2.6);
       else text(x, initial, 2 + 22 + 42, 67, 700, 42, V4.ink, 'center');
@@ -872,6 +895,8 @@ export class KinlyAR {
       ok: { label: 'OK', icon: 'check', primary: true },
       retry: { label: confirm ? 'Change it' : 'Try again', icon: 'mic' },
       cancel: { label: 'Cancel', icon: 'x' },
+      forget: { label: 'Forget', icon: 'trash' },
+      'forget-yes': { label: 'Yes, forget', icon: 'trash', primary: true },
       close: { label: 'Close', icon: 'x' },
       'obj-save': { label: 'Save', icon: 'check', primary: true },
       'obj-later': { label: 'Not now', icon: 'x' },
@@ -970,32 +995,7 @@ export class KinlyAR {
     });
   }
 
-  // Person out of view (design: edge arrow): avatar, name, "relation · on your right", a white circle with an arrow
-  _edgeTex(name, second, right) {
-    const W = 16 + 76 + 16 + Math.max(textWidth(name, 700, 32), textWidth(second, 700, 24)) + 16 + 64 + 18;
-    return this._paint(`edge|${name}|${second}|${right}`, W + 4, 114, (x) => {
-      glass(x, 2, 2, W, 110, 55, 'rgba(16,34,26,0.84)', 'rgba(255,255,255,0.22)');
-      const order = right ? ['avatar', 'text', 'arrow'] : ['arrow', 'avatar', 'text'];
-      let X = 2 + (right ? 16 : 18);
-      for (const part of order) {
-        if (part === 'avatar') {
-          x.fillStyle = V4.mint; x.beginPath(); x.arc(X + 38, 57, 38, 0, Math.PI * 2); x.fill();
-          text(x, name.charAt(0).toUpperCase(), X + 38, 57, 700, 38, V4.ink, 'center');
-          X += 76 + 16;
-        } else if (part === 'text') {
-          text(x, name, X, 42, 700, 32, V4.text);
-          text(x, second, X, 76, 700, 24, V4.mint);
-          X += Math.max(textWidth(name, 700, 32), textWidth(second, 700, 24)) + 16;
-        } else {
-          x.fillStyle = '#FFFFFF'; x.beginPath(); x.arc(X + 32, 57, 32, 0, Math.PI * 2); x.fill();
-          icon(x, ICON[right ? 'chevronR' : 'chevronL'], X + 32 - 18, 57 - 18, 36, V4.ink, 3);
-          X += 64 + 16;
-        }
-      }
-    });
-  }
-
-  // Menu bar (design): "Look at a button, then pinch" above a row of pills; returns the bar with item slots
+  // Menu bar (design): a row of pills, always on at the bottom of the view; returns the bar with item slots
   _menuTex() {
     const items = ['m-here', 'm-memory', 'm-speak', 'm-pause', 'm-exit'];
     const widths = items.map((id) => 20 + 32 + 12 + textWidth(this._buttonDef(id).label, 700, 27) + 26);
@@ -1118,31 +1118,49 @@ export class KinlyAR {
       };
     };
 
-    // HUD: high in the view, world-locked; moves in front again after the wearer has looked away for a second
+    // HUD at the top edge of the view: the date and time, plus a chip for walking, paused help or waiting updates
     const clock = new Date().toLocaleDateString('en-GB', { weekday: 'short', day: 'numeric', month: 'short' }).replace(/,/g, '')
       + ' · ' + new Date().toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' });
     let chip = null;
     if (this.walking) chip = { label: 'Walking — screen kept clear', icon: 'walk', border: V4.sand };
-    else if (this.paused) chip = { label: 'Help paused — pinch to resume', icon: 'pause' };
+    else if (this.paused) chip = { label: 'Help paused', icon: 'pause' };
     else if (this.toasts.length && this._talking()) chip = { label: `${this.toasts.length} update${this.toasts.length > 1 ? 's' : ''} — after your talk`, dot: true };
     const hudTex = this._hudTex(clock, chip);
     quad(hudTex, this.hud.pos, this.hud.yaw, HUD_SCALE);
     const underHud = (tex, k = 1) => [this.hud.pos[0], this.hud.pos[1] - (hudTex.size[1] / 2 + gap * k + tex.size[1] / 2) * HUD_SCALE, this.hud.pos[2]];
+
+    // Menu at the bottom edge of the view, always on (also while walking)
+    const m = this.menuAt, bar = this._menuTex(), [barW] = bar.px;
+    quad(bar, m.pos, m.yaw, MENU_SCALE);
+    const mr = [Math.cos(m.yaw), 0, -Math.sin(m.yaw)];
+    for (const slot of bar.slots) {
+      const dx = (slot.x + slot.w / 2 - barW / 2) * DPX * MENU_SCALE;
+      button(slot.id, [m.pos[0] + mr[0] * dx, m.pos[1], m.pos[2] + mr[2] * dx], m.yaw, MENU_SCALE, slot.w, 92);
+    }
     if (this.walking) return items;
 
-    let busy = false; // anything besides the HUD on show (else the idle hint appears)
     if (!this.paused) {
+      // Known people: the name only; a pinch on the tag adds the relation, the last topic and Forget
       for (const [name, tag] of this.known) {
-        if (now - tag.seen > KNOWN_TTL_MS) { this.known.delete(name); continue; }
-        busy = true;
-        const d = dock({ kind: 'face', pos: tag.pos, yaw: yawTo(tag.pos, eye), scale: Math.max(1, tag.dist / 1.5) });
-        const tex = this._tagTex(tag.name, tag.relation, tag.name.charAt(0).toUpperCase());
-        d.place(tex, 0);
-        if (tag.topic) { const chipTex = this._chipTex(tag.topic, 'topic'); d.place(chipTex, -(tex.size[1] / 2 + gap + chipTex.size[1] / 2) * d.s); }
+        if (now - tag.seen > KNOWN_TTL_MS) { this.known.delete(name); if (this.expanded === name) this.expanded = null; continue; }
+        if (this.flow && this.flow.kind === 'forget' && this.flow.name === name) continue; // the Forget card is in its place
+        const yaw = yawTo(tag.pos, eye), open = this.expanded === name, id = `p:${name}`;
+        const d = dock({ kind: 'face', pos: tag.pos, yaw, scale: Math.max(1, tag.dist / 1.5) });
+        const tex = this._tagTex(tag.name, open ? tag.relation : '', tag.name.charAt(0).toUpperCase(), undefined, this.hovered.has(id));
+        const pos = d.place(tex, 0);
+        this.buttons.push({ id, pos, yaw, w: (tex.px[0] - 4) * DPX * d.s, h: (tex.px[1] - 4) * DPX * d.s });
+        if (open) {
+          let y = -(tex.size[1] / 2 + gap) * d.s;
+          if (tag.topic) {
+            const chipTex = this._chipTex(tag.topic, 'topic');
+            d.place(chipTex, y - (chipTex.size[1] / 2) * d.s);
+            y -= (chipTex.size[1] + gap) * d.s;
+          }
+          d.button('forget', y - ((100 * DPX) / 2) * d.s, undefined, 2);
+        }
       }
       if (this.unknown && !this.flow && now - this.unknown.seen > UNKNOWN_TTL_MS) this.unknown = null;
       if (this.unknown && !this.flow) {
-        busy = true;
         const u = this.unknown, a = this._faceAnchor(u), d = dock(a);
         const tex = this._tagTex('Unknown person', '', '?');
         d.place(tex, 0);
@@ -1150,30 +1168,15 @@ export class KinlyAR {
       }
       if (!(this.flow && this.flow.kind === 'object')) {
         for (const o of this.objects) {
-          busy = true;
           const a = this._objectAnchor(o);
           quad(this._frameTex(o.size[0] / DPX, o.size[1] / DPX), o.pos, a.yaw);
           dock(a).place(this._tagTex(o.name, o.sub, '', o.medicine ? 'pill' : 'box'), 0);
         }
       }
-      // People seen a moment ago who are now out of view: an arrow at the edge of the view (head-locked)
-      const missing = [...this.lastSeen.entries()]
-        .filter(([name, p]) => !this.known.has(name) && now - p.seen < PERSON_MEMORY_MS && Math.abs(sideAngle(head, eye, p.pos)) > OUT_OF_VIEW_DEG)
-        .sort((a, b) => b[1].seen - a[1].seen)[0];
-      if (missing && !this.flow && !this.menu && !this.board) {
-        busy = true;
-        const [name, p] = missing;
-        const ang = sideAngle(head, eye, p.pos), right = ang > 0;
-        const where = Math.abs(ang) > 120 ? 'behind you' : right ? 'on your right' : 'on your left';
-        const tex = this._edgeTex(name, [p.relation, where].filter(Boolean).join(' · '), right);
-        const pos = apply(head, (right ? 1 : -1) * EDGE_X, -0.02, -EDGE_DIST);
-        quad(tex, pos, yawTo(pos, eye), 0.85);
-      }
     }
 
     // The open card of a flow
     if (this.flow && this.flow.view) {
-      busy = true;
       const f = this.flow, v = f.view;
       if (f.kind === 'object' && f.anchor.kind === 'object' && this.target) {
         const a = f.anchor;
@@ -1198,23 +1201,8 @@ export class KinlyAR {
       }
     }
 
-    // Menu (design: summoned by a pinch, world-locked where it opened)
-    if (this.menu) {
-      busy = true;
-      const m = this.menu, bar = this._menuTex(), [W] = bar.px;
-      quad(bar, m.pos, m.yaw);
-      const hint = this._chipTex('Point at a button, then pinch');
-      quad(hint, [m.pos[0], m.pos[1] + bar.size[1] / 2 + 12 * DPX + hint.size[1] / 2, m.pos[2]], m.yaw);
-      const r = [Math.cos(m.yaw), 0, -Math.sin(m.yaw)];
-      for (const slot of bar.slots) {
-        const dx = (slot.x + slot.w / 2 - (W) / 2) * DPX;
-        button(slot.id, [m.pos[0] + r[0] * dx, m.pos[1], m.pos[2] + r[2] * dx], m.yaw, 1, slot.w, 92);
-      }
-    }
-
     // My memory board (stays where it opened)
     if (this.board) {
-      busy = true;
       const b = this.board.anchor, tex = this._boardTex(this.board);
       quad(tex, b.pos, b.yaw);
       button('board-close', [b.pos[0], b.pos[1] - tex.size[1] / 2 - gap - (100 * DPX) / 2, b.pos[2]], b.yaw);
@@ -1227,30 +1215,19 @@ export class KinlyAR {
     }
     if (this.toast) {
       if (now > this.toast.until) this.toast = null;
-      else { busy = true; const t = this._toastTex(this.toast.title, this.toast.detail); quad(t, underHud(t, 1.5), this.hud.yaw, HUD_SCALE); }
-    }
-    if (!busy && !this.paused) { // paused: the HUD already says how to resume
-      const idle = this._chipTex('Pinch for the menu');
-      quad(idle, underHud(idle), this.hud.yaw, HUD_SCALE);
+      else { const t = this._toastTex(this.toast.title, this.toast.detail); quad(t, underHud(t, 1.5), this.hud.yaw, HUD_SCALE); }
     }
     return items;
   }
 
-  _updateHud(head, eye, now) {
-    if (!this.hud) {
-      const pos = ahead(head, eye, HUD_DIST, HUD_UP);
-      this.hud = { pos, yaw: yawTo(pos, eye), awaySince: 0 };
-      return;
-    }
-    if (Math.abs(sideAngle(head, eye, this.hud.pos)) > HUD_AWAY_DEG) {
-      if (!this.hud.awaySince) this.hud.awaySince = now;
-      if (now - this.hud.awaySince > HUD_AWAY_MS) {
-        const pos = ahead(head, eye, HUD_DIST, HUD_UP);
-        this.hud = { pos, yaw: yawTo(pos, eye), awaySince: 0 };
-      }
-    } else {
-      this.hud.awaySince = 0;
-    }
+  // The HUD and the menu follow the head, a little smoothed: the HUD at the top edge of the view, the menu at the bottom
+  _follow(head, eye, now) {
+    const k = this.lastFollow ? 1 - Math.exp(-(now - this.lastFollow) / 1000 / FOLLOW_S) : 1;
+    this.lastFollow = now;
+    const at = (d, deg) => { const a = (deg * Math.PI) / 180; return apply(head, 0, d * Math.sin(a), -d * Math.cos(a)); };
+    const step = (cur, target) => { const pos = cur ? lerp3(cur.pos, target, k) : target; return { pos, yaw: yawTo(pos, eye) }; };
+    this.hud = step(this.hud, at(HUD_DIST, HUD_UP_DEG));
+    this.menuAt = step(this.menuAt, at(MENU_DIST, -MENU_DOWN_DEG));
   }
 
   _updateWalking(eye, now) {
@@ -1265,7 +1242,6 @@ export class KinlyAR {
       if (now - this.walkSince > (this.walking ? WALK_STOP_MS : WALK_START_MS)) {
         this.walking = fast;
         this.walkSince = 0;
-        if (fast) this.menu = null;
       }
     } else {
       this.walkSince = 0;
@@ -1291,7 +1267,7 @@ export class KinlyAR {
     this.eye = eye;
     this.head = head;
     if (!this.paused && now - this.lastCapture >= FRAME_MS) { this.lastCapture = now; this._capture(head); }
-    this._updateHud(head, eye, now);
+    this._follow(head, eye, now);
     this._updateWalking(eye, now);
     this._updateLevel(now);
 
